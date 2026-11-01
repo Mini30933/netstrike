@@ -1,6 +1,6 @@
 # NetStrike
 
-交互式高并发网络压力测试工具，Linux 服务器专用。基于 Python 3.8+ 标准库实现，无需 pip 安装任何依赖。
+交互式高并发网络压力测试工具，跨平台（Linux / Windows）。基于 Python 3.8+ 标准库实现，无需 pip 安装任何依赖。
 
 ## 免责声明
 
@@ -12,29 +12,34 @@
 - 5 档强度：light / normal / heavy / extreme / insane
 - 多进程 + 每进程多线程，实时输出 pps / Mbps / 连接数 / 错误率
 - TLS 压测：可锁 TLS 1.2 / 1.3，支持 SNI、ALPN、Cipher 套件、Host 头覆盖、连接复用与握手并发上限
-- 源 IP 伪造（SYN / UDP，需 root）
-- 连通性预检、错误分类与根因诊断
-- 测试结束输出汇总报告
+- HTTP 响应策略：等待完整响应（数据可信）或发射后不管（纯压带宽）
+- 源 IP 伪造（SYN / UDP，需 root / 管理员）
+- 跨平台抽象：Linux 走 `/proc` 与原始套接字；Windows 走 iphlpapi 与 IP_HDRINCL，并自动开启控制台 ANSI
+- 连通性预检、错误分类与根因诊断，测试结束输出汇总报告
 
 ## 环境要求
 
-- Linux（依赖原始套接字与 `/proc`）
+- Linux 或 Windows（macOS 可运行但原始套接字向量未做适配）
 - Python 3.8+
-- root 权限（SYN / UDP 原始包向量需要；TCP / HTTP / HTTPS / DNS 不需要）
-- 建议先执行 `ulimit -n 1048576` 提高 fd 上限
+- 特权：Linux 需 root，Windows 需「以管理员身份运行」才能使用 SYN / UDP 原始包向量；TCP / HTTP / HTTPS / DNS 无需特权
+- Linux 建议先执行 `ulimit -n 1048576` 提高 fd 上限
 
 ## 快速开始
 
 ```bash
+# Linux
 python3 netstrike.py
+
+# Windows（管理员 CMD/PowerShell）
+python netstrike.py
 ```
 
 全部为交互式问答，无命令行参数。启动后依次输入即可。
 
 ## 攻击向量
 
-| 编号 | 向量 | 说明 | 需 root |
-|------|------|------|---------|
+| 编号 | 向量 | 说明 | 特权 |
+|------|------|------|------|
 | 1 | SYN 洪水 | 原始套接字灌满目标 SYN 队列形成半连接 | 是 |
 | 2 | TCP 洪水 | 并发 connect，耗尽 accept 队列与 fd 表 | 否 |
 | 3 | UDP 洪水 | 大包/小包混合，淹没带宽与报文队列 | 是 |
@@ -68,8 +73,9 @@ python3 netstrike.py
 9. HTTP 模式：方法（GET/POST/PUT/HEAD）、请求路径、请求体大小
 10. TLS 模式：证书校验、TLS 版本（1.2 / 1.3 / auto）、ALPN、SNI、Host 头覆盖、Cipher 套件、连接复用、握手并发上限
 11. 建连 / 握手超时（秒）
-12. SYN / UDP 模式：是否伪造源 IP
-13. 确认后开始
+12. HTTP 模式：是否等待完整响应；等待时再设单条响应超时（秒）
+13. SYN / UDP 模式：是否伪造源 IP
+14. 确认后开始
 
 ## 输出报告
 
